@@ -8,7 +8,7 @@ import math
 from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor, QFont
 
-# Координаты Иркутска
+# Координаты ИрНИТУ
 LON = 104.261370
 LAT = 52.262468
 
@@ -20,11 +20,10 @@ def full_isochrone_pipeline():
     # 1. Проверяем слой дорог
     roads = iface.activeLayer()
     if not roads or roads.geometryType() != QgsWkbTypes.LineGeometry:
-        print("❌ Нет линейного слоя дорог!")
-        print("Загрузите УДС_link.shp и сделайте его активным")
+        print("Нет линейного слоя дорог!")
         return
     
-    print(f"✅ Дороги: {roads.name()} ({roads.featureCount()} сегментов)")
+    print(f"Дороги: {roads.name()} ({roads.featureCount()} сегментов)")
     
     # 2. Преобразуем координаты
     print(f"\n📍 Преобразование координат...")
@@ -40,16 +39,16 @@ def full_isochrone_pipeline():
         print(f"   {roads_crs.authid()}: {point.x():.2f}, {point.y():.2f}")
         
     except Exception as e:
-        print(f"❌ Ошибка преобразования: {e}")
+        print(f"Ошибка преобразования: {e}")
         return
     
     # 3. Параметры
     speed_kmh = 5
     time_intervals = [5, 10, 15]
     
-    print(f"\n📊 Параметры расчета:")
-    print(f"   Скорость: {speed_kmh} км/ч (пешком)")
-    print(f"   Интервалы: {time_intervals} минут")
+    print(f"\nПараметры расчета:")
+    print(f"Скорость: {speed_kmh} км/ч (пешком)")
+    print(f"Интервалы: {time_intervals} минут")
     
     # 4. Очистка старых слоев
     print(f"\n🗑️ Очистка старых данных...")
@@ -64,7 +63,7 @@ def full_isochrone_pipeline():
     print(f"   Удалено слоев: {len(layers_to_remove)}")
     
     # 5. Создаем точку старта
-    print(f"\n📍 Создание точки старта...")
+    print(f"\nСоздание точки старта...")
     point_layer = QgsVectorLayer(f"Point?crs={roads_crs.authid()}", "Точка старта", "memory")
     feat = QgsFeature()
     feat.setGeometry(QgsGeometry.fromPointXY(point))
@@ -79,7 +78,7 @@ def full_isochrone_pipeline():
     })
     point_layer.renderer().setSymbol(symbol)
     QgsProject.instance().addMapLayer(point_layer)
-    print(f"   ✅ Точка создана")
+    print(f"   Точка создана")
     
     # 6. СОЗДАЕМ ЛИНИИ МАРШРУТОВ И ИЗВЛЕКАЕМ КРАЙНИЕ ТОЧКИ
     print(f"\n" + "-" * 40)
@@ -99,7 +98,7 @@ def full_isochrone_pipeline():
         print(f"   Расстояние: {distance_m:.0f} м")
         
         # Пробуем алгоритм
-        print(f"   🔄 Создание линий...")
+        print(f"   Создание линий...")
         
         params = {
             'INPUT': roads,
@@ -142,14 +141,14 @@ def full_isochrone_pipeline():
                             
                             QgsProject.instance().addMapLayer(lines)
                             line_layers.append(lines)
-                            print(f"   ✅ Линии созданы: {lines.featureCount()} сегментов")
+                            print(f"   Линии созданы: {lines.featureCount()} сегментов")
                             
                             # Счетчики для отладки
                             total_segments = 0
                             end_points_added = 0
                             
                             # ИЗВЛЕКАЕМ ТОЛЬКО КРАЙНИЕ ТОЧКИ
-                            print(f"   📍 Извлечение КРАЙНИХ точек маршрутов...")
+                            print(f"   Извлечение КРАЙНИХ точек маршрутов...")
                             
                             for feature in lines.getFeatures():
                                 geom = feature.geometry()
@@ -190,22 +189,22 @@ def full_isochrone_pipeline():
                                             end_points_added += 1
                                             print(f"      Добавлена точка: {last_point.x():.2f}, {last_point.y():.2f}")
                             
-                            print(f"   📊 Сегментов: {total_segments}, КРАЙНИХ точек добавлено: {end_points_added}")
+                            print(f"   Сегментов: {total_segments}, КРАЙНИХ точек добавлено: {end_points_added}")
                             
                             lines_created = True
                             break  # Выходим из цикла алгоритмов
                             
                 except Exception as e:
-                    print(f"   ⚠️ Алгоритм {algorithm} не сработал: {e}")
+                    print(f"   Алгоритм {algorithm} не сработал: {e}")
                     continue
             
             if not lines_created:
-                print(f"   ⚠️ Не удалось создать линии, пропускаю")
+                print(f"   Не удалось создать линии, пропускаю")
                 
         except Exception as e:
-            print(f"   ❌ Ошибка: {e}")
+            print(f"   Ошибка: {e}")
 
-    print(f"\n📊 ИТОГО собрано КРАЙНИХ точек:")
+    print(f"\nИТОГО собрано КРАЙНИХ точек:")
     print(f"   5 минут: {len(end_points_five)} точек")
     print(f"   10 минут: {len(end_points_ten)} точек")
     print(f"   15 минут: {len(end_points_fiveteen)} точек")
@@ -219,10 +218,10 @@ def full_isochrone_pipeline():
         """Создает ЕДИНЫЙ полигон из списка КРАЙНИХ точек"""
         
         if len(points) < 3:
-            print(f"⚠️ Недостаточно КРАЙНИХ точек для полигона {name} ({len(points)} точек)")
+            print(f"Недостаточно КРАЙНИХ точек для полигона {name} ({len(points)} точек)")
             return None
         
-        print(f"   🔷 Создание полигона {name} из {len(points)} крайних точек...")
+        print(f"   Создание полигона {name} из {len(points)} крайних точек...")
         
         # 1. Создаем временный слой точек
         temp_layer = QgsVectorLayer(f"Point?crs={roads_crs.authid()}", f"temp_{name}", "memory")
@@ -238,7 +237,7 @@ def full_isochrone_pipeline():
         temp_layer.updateExtents()
         
         # 2. Создаем ЕДИНУЮ выпуклую оболочку всех точек
-        print(f"   📐 Создание выпуклой оболочки...")
+        print(f"   Создание выпуклой оболочки...")
         
         # Используем dissolve, чтобы объединить все точки перед созданием оболочки
         dissolve_params = {
@@ -253,7 +252,7 @@ def full_isochrone_pipeline():
         convex_layer = processing.run("native:convexhull", convex_params)['OUTPUT']
         
         if convex_layer.featureCount() == 0:
-            print(f"   ❌ Не удалось создать выпуклую оболочку для {name}")
+            print(f"   Не удалось создать выпуклую оболочку для {name}")
             return None
         
         # 3. Создаем финальный полигонный слой с ЕДИНЫМ объектом
@@ -276,7 +275,7 @@ def full_isochrone_pipeline():
             
             # Проверяем и исправляем геометрию один раз
             if not polygon_geom.isGeosValid():
-                print(f"   ⚠️ Геометрия требует исправления...")
+                print(f"   Геометрия требует исправления...")
                 polygon_geom = polygon_geom.makeValid()
             
             # Рассчитываем площадь
@@ -324,7 +323,7 @@ def full_isochrone_pipeline():
         polygon_layer.setLabeling(layer_labeling)
         polygon_layer.setLabelsEnabled(True)
         
-        print(f"   ✅ Полигон {name} создан: 1 объект, площадь: {area_m2:.0f} м²")
+        print(f"   Полигон {name} создан: 1 объект, площадь: {area_m2:.0f} м²")
         return polygon_layer
     
     def create_combined_point_layer(points_dict):
@@ -342,7 +341,7 @@ def full_isochrone_pipeline():
                 })
         
         if not all_points:
-            print("⚠️ Нет КРАЙНИХ точек для отображения")
+            print("Нет КРАЙНИХ точек для отображения")
             return None
         
         # Создаем слой
@@ -446,7 +445,7 @@ def full_isochrone_pipeline():
             return "255,0,0"
 
     # Создаем объединенный слой КРАЙНИХ точек
-    print(f"📍 Создание объединенного слоя КРАЙНИХ точек...")
+    print(f"Создание объединенного слоя КРАЙНИХ точек...")
     points_dict = {
         5: end_points_five if end_points_five else [],
         10: end_points_ten if end_points_ten else [],
@@ -456,46 +455,14 @@ def full_isochrone_pipeline():
     combined_layer = create_combined_point_layer(points_dict)
     if combined_layer:
         QgsProject.instance().addMapLayer(combined_layer)
-        print(f"✅ Объединенный слой КРАЙНИХ точек создан: {combined_layer.featureCount()} точек")
+        print(f"Объединенный слой КРАЙНИХ точек создан: {combined_layer.featureCount()} точек")
 
     # Создаем полигоны из КРАЙНИХ точек
     polygon_layers = []
-    
-    # 1. Полигон для 5 минут
-    if len(end_points_five) >= 3:
-        print("\n🔷 Создание полигона для 5 минут из КРАЙНИХ точек...")
-        polygon_five = create_polygon_from_end_points(
-            end_points_five,  # НЕ замыкаем! Функция сама создаст выпуклую оболочку
-            "Изохрона_5мин",
-            "255,255,0,80",      # Желтый с прозрачностью
-            "255,200,0"         # Оранжевая граница
-        )
-        if polygon_five:
-            QgsProject.instance().addMapLayer(polygon_five)
-            polygon_layers.append(polygon_five)
-            print(f"✅ Полигон 5 мин создан")
-    else:
-        print("⚠️ Недостаточно КРАЙНИХ точек для полигона 5 минут")
-
-    # 2. Полигон для 10 минут
-    if len(end_points_ten) >= 3:
-        print("\n🔷 Создание полигона для 10 минут из КРАЙНИХ точек...")
-        polygon_ten = create_polygon_from_end_points(
-            end_points_ten,
-            "Изохрона_10мин",
-            "255,165,0,100",    # Оранжевый с прозрачностью
-            "255,100,0"         # Темно-оранжевая граница
-        )
-        if polygon_ten:
-            QgsProject.instance().addMapLayer(polygon_ten)
-            polygon_layers.append(polygon_ten)
-            print(f"✅ Полигон 10 мин создан")
-    else:
-        print("⚠️ Недостаточно КРАЙНИХ точек для полигона 10 минут")
 
     # 3. Полигон для 15 минут
     if len(end_points_fiveteen) >= 3:
-        print("\n🔷 Создание полигона для 15 минут из КРАЙНИХ точек...")
+        print("\nСоздание полигона для 15 минут из КРАЙНИХ точек...")
         polygon_fifteen = create_polygon_from_end_points(
             end_points_fiveteen,
             "Изохрона_15мин",
@@ -505,13 +472,45 @@ def full_isochrone_pipeline():
         if polygon_fifteen:
             QgsProject.instance().addMapLayer(polygon_fifteen)
             polygon_layers.append(polygon_fifteen)
-            print(f"✅ Полигон 15 мин создан")
+            print(f"Полигон 15 мин создан")
     else:
-        print("⚠️ Недостаточно КРАЙНИХ точек для полигона 15 минут")
+        print("Недостаточно КРАЙНИХ точек для полигона 15 минут")
+
+    # 2. Полигон для 10 минут
+    if len(end_points_ten) >= 3:
+        print("\nСоздание полигона для 10 минут из КРАЙНИХ точек...")
+        polygon_ten = create_polygon_from_end_points(
+            end_points_ten,
+            "Изохрона_10мин",
+            "255,165,0,100",    # Оранжевый с прозрачностью
+            "255,100,0"         # Темно-оранжевая граница
+        )
+        if polygon_ten:
+            QgsProject.instance().addMapLayer(polygon_ten)
+            polygon_layers.append(polygon_ten)
+            print(f"Полигон 10 мин создан")
+    else:
+        print("Недостаточно КРАЙНИХ точек для полигона 10 минут")
+
+    # 1. Полигон для 5 минут
+    if len(end_points_five) >= 3:
+        print("\nСоздание полигона для 5 минут из КРАЙНИХ точек...")
+        polygon_five = create_polygon_from_end_points(
+            end_points_five,  # НЕ замыкаем! Функция сама создаст выпуклую оболочку
+            "Изохрона_5мин",
+            "255,255,0,80",      # Желтый с прозрачностью
+            "255,200,0"         # Оранжевая граница
+        )
+        if polygon_five:
+            QgsProject.instance().addMapLayer(polygon_five)
+            polygon_layers.append(polygon_five)
+            print(f"Полигон 5 мин создан")
+    else:
+        print("Недостаточно КРАЙНИХ точек для полигона 5 минут")
 
     # 8. Финальные действия
     print(f"\n" + "-" * 40)
-    print("ЭТАП 3: ФИНАЛИЗАЦИЯ")
+    print("ЭТАП 3")
     print("-" * 40)
     
     # Принудительно обновляем карту
@@ -550,21 +549,13 @@ def full_isochrone_pipeline():
             iface.mapCanvas().setExtent(combined_extent)
             iface.mapCanvas().refresh()
     
-    print(f"\n" + "=" * 80)
-    print("✅ ПОЛНЫЙ ЦИКЛ ЗАВЕРШЕН!")
-    print("=" * 80)
     print("Создано:")
-    print("  🔴 Точка старта")
-    print("  📍 Линии маршрутов")
-    print("  🔵 Слой КРАЙНИХ точек маршрутов")
-    print("  🟡 Полигоны изохрон из КРАЙНИХ точек")
-    print(f"\n📍 Точка: {LAT:.6f}°N, {LON:.6f}°E")
-    print(f"🚶 Скорость: {speed_kmh} км/ч")
-    print(f"⏱️  Времена: {', '.join(str(t) for t in time_intervals)} мин")
-    print("=" * 80)
+    print(f"\nТочка: {LAT:.6f}°N, {LON:.6f}°E")
+    print(f"Скорость: {speed_kmh} км/ч")
+    print(f"Времена: {', '.join(str(t) for t in time_intervals)} мин")
     
     # Дополнительная проверка
-    print(f"\n🔍 Проверка созданных слоев:")
+    print(f"\nПроверка созданных слоев:")
     layer_count = 0
     for layer in QgsProject.instance().mapLayers().values():
         if any(keyword in layer.name() for keyword in ['Точка', 'Линии', 'Все_крайние_точки', 'Изохрона']):
@@ -573,8 +564,8 @@ def full_isochrone_pipeline():
                 print(f"   {layer.name()}: {layer.featureCount()} объектов")
                 layer_count += 1
     
-    print(f"\n📊 Итого создано слоев: {layer_count}")
+    print(f"\nИтого создано слоев: {layer_count}")
 
 # Запускаем полный цикл
-print("\n🚀 Запуск полного цикла создания изохрон...")
+print("\nЗапуск полного цикла создания изохрон...")
 full_isochrone_pipeline()
