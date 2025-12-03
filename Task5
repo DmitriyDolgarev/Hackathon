@@ -1,0 +1,1557 @@
+# ==================== ПОЛНЫЙ КОД ДЛЯ ЗАПУСКА В КОНСОЛИ PYTHON ====================
+
+from qgis.core import *
+import processing
+import math
+from qgis.PyQt.QtGui import QColor, QFont
+from qgis.PyQt.QtCore import QVariant
+
+# ==================== КОНФИГУРАЦИЯ ====================
+CAR_TIME_INTERVALS = [10, 15]  # минуты для автомобиля
+
+# Скорость для автомобиля
+CAR_SPEED_KMH = 40.0  # км/ч
+
+# Цвета для автомобильных изохрон
+CAR_COLORS = [
+    ("0,165,255,80", "0,100,200"),      # 10 мин - голубой
+    ("0,0,255,100", "0,0,200")          # 15 мин - синий
+]
+
+SELECTED_DISTRICTS_COUNT = 2
+
+# Глобальная переменная для текущего режима
+CURRENT_MODE = 'car'
+
+# Глобальные переменные для данных о населении
+POPULATION_LAYER = None
+POPULATION_FIELD = None
+
+# ==================== ФУНКЦИИ ДЛЯ РАСЧЕТА НАСЕЛЕНИЯ ====================
+def find_population_layer():
+    """Находит слой с населением (здания)"""
+    
+    print("\nПоиск слоя с населением...")
+    
+    population_layer = None
+    population_field = None
+    
+    layer_names = [
+        "Здания_насел_attract",
+        "здания_насел_attract",
+        "buildings_population",
+        "population_buildings"
+    ]
+    
+    for layer_name in layer_names:
+        layers = QgsProject.instance().mapLayersByName(layer_name)
+        if layers:
+            layer = layers[0]
+            if isinstance(layer, QgsVectorLayer) and layer.geometryType() == QgsWkbTypes.PolygonGeometry:
+                population_layer = layer
+                print(f"Найден слой по имени: {layer.name()} (тип: {layer.geometryType()})")
+                break
+    
+    if not population_layer:
+        print("Поиск среди всех полигональных слоев...")
+        for layer in QgsProject.instance().mapLayers().values():
+            if isinstance(layer, QgsVectorLayer) and layer.geometryType() == QgsWkbTypes.PolygonGeometry:
+                layer_name = layer.name().lower()
+                if not any(boundary_word in layer_name for boundary_word in ['границы', 'boundary', 'borders', 'limits']):
+                    print(f"Найден полигональный слой (вероятно здания): {layer.name()}")
+                    population_layer = layer
+                    break
+
+        if not population_layer:
+            for layer in QgsProject.instance().mapLayers().values():
+                if isinstance(layer, QgsVectorLayer) and layer.geometryType() == QgsWkbTypes.PolygonGeometry:
+                    print(f"Используем первый полигональный слой: {layer.name()}")
+                    population_layer = layer
+                    break
+    
+    if not population_layer:
+        print("Слой с зданиями не найден!")
+        return None, None
+    
+    print(f"Поиск поля с населением в слое: {population_layer.name()}")
+
+    print(f"Все поля слоя:")
+    for i, field in enumerate(population_layer.fields()):
+        print(f"     {i+1}. {field.name()} ({field.typeName()})")
+
+    if population_layer.name() == "Иркутск_границы":
+        print("ОШИБКА: Найден слой границ города вместо слоя зданий!")
+        print("Убедитесь, что загружен слой 'Здания_насел_attract'")
+        return None, None
+
+    possible_field_names = [
+        'Насел',
+        'население', 'population', 'pop', 'жители', 'people',
+        'residents', 'жильцы', 'население_здания'
+    ]
+
+    population_field = None
+
+    for field_name in possible_field_names:
+        if field_name in [field.name() for field in population_layer.fields()]:
+            population_field = field_name
+            print(f"Найдено поле населения: '{population_field}'")
+            break
+
+    if not population_field:
+        print("Поиск числовых полей...")
+        exclude_fields = ['NO', 'OSM_ID', 'id', 'fid', 'gid']
+
+        for field in population_layer.fields():
+            field_name = field.name()
+            if (field_name not in exclude_fields and
+                field.type() in [QVariant.Int, QVariant.Double, QVariant.LongLong] and
+                field_name not in ['wkt_geom']):
+
+                sample_count = 0
+                total_value = 0
+
+                for feature in population_layer.getFeatures():
+                    if sample_count >= 10:
+                        break
+
+                    value = feature[field_name]
+                    if value is not None and str(value).strip() != '':
+                        try:
+                            num_value = float(str(value).replace(',', '.'))
+                            if num_value > 0:
+                                total_value += num_value
+                                sample_count += 1
+                        except (ValueError, TypeError):
+                            continue
+
+                if sample_count > 0 and total_value > 0:
+                    population_field = field_name
+                    print(f"Выбрано числовое поле с данными: '{population_field}' (среднее: {total_value/sample_count:.1f})")
+                    break
+    
+    if population_field:
+        print(f"\nПроверка данных в поле '{population_field}':")
+        
+        total_population = 0
+        non_null_count = 0
+        sample_size = min(100, population_layer.featureCount())
+        
+        for i, feature in enumerate(population_layer.getFeatures()):
+            if i >= sample_size:
+                break
+                
+            pop_value = feature[population_field]
+            if pop_value is not None and pop_value != '':
+                try:
+                    pop_num = float(pop_value)
+                    total_population += pop_num
+                    non_null_count += 1
+                except (ValueError, TypeError):
+                    pass
+        
+        if non_null_count > 0:
+            print(f"Образец: {non_null_count} из {sample_size} объектов имеют данные")
+            print(f"Среднее население на здание: {total_population/non_null_count:.1f} чел.")
+        else:
+            print(f"В первых {sample_size} объектах нет числовых данных")
+            print(f"Проверьте правильность выбранного поля")
+    
+    return population_layer, population_field
+
+def calculate_population_in_polygon(polygon_geom, polygon_layer_crs, population_layer, population_field):
+    """
+    Оптимизированный расчет населения внутри полигона
+    
+    Parameters:
+    -----------
+    polygon_geom : QgsGeometry
+        Геометрия полигона для расчета
+    polygon_layer_crs : QgsCoordinateReferenceSystem
+        CRS слоя полигона
+    population_layer : QgsVectorLayer
+        Слой с зданиями и населением
+    population_field : str
+        Поле с данными о населении
+    
+    Returns:
+    --------
+    tuple: (total_population, buildings_count)
+    """
+    
+    total_population = 0
+    buildings_count = 0
+    
+    if not population_layer or not population_field:
+        print("Нет данных о населении для расчета")
+        return 0, 0
+    
+    print(f"Оптимизированный расчет населения...")
+    
+    try:
+        polygon_geom_for_calculation = QgsGeometry(polygon_geom)
+        polygon_crs = polygon_layer_crs
+        buildings_crs = population_layer.crs()
+        
+        if polygon_crs.authid() != buildings_crs.authid():
+            print(f"Преобразование CRS копии полигона...")
+            transform = QgsCoordinateTransform(polygon_crs, buildings_crs, QgsProject.instance())
+            polygon_geom_for_calculation.transform(transform)
+        
+        print(f"Координаты полигона:")
+        bbox = polygon_geom_for_calculation.boundingBox()
+        print(f"BBox: X={bbox.xMinimum():.0f}-{bbox.xMaximum():.0f}, Y={bbox.yMinimum():.0f}-{bbox.yMaximum():.0f}")
+        print(f"   Создание пространственного индекса зданий...")
+        
+        spatial_index = QgsSpatialIndex()
+        feature_ids = []
+        
+        print(f"   Индексация {population_layer.featureCount()} зданий...")
+        
+        for feature in population_layer.getFeatures():
+            if feature.geometry():
+                spatial_index.addFeature(feature)
+                feature_ids.append(feature.id())
+        
+        print(f"Индекс создан. Всего в индексе: {len(feature_ids)} зданий")
+        print(f"Поиск зданий в bounding box полигона...")
+        
+        buffer_distance = 10
+        bbox_buffered = QgsRectangle(
+            bbox.xMinimum() - buffer_distance,
+            bbox.yMinimum() - buffer_distance,
+            bbox.xMaximum() + buffer_distance,
+            bbox.yMaximum() + buffer_distance
+        )
+        
+        candidate_ids = spatial_index.intersects(bbox_buffered)
+        print(f"Найдено кандидатов в BBox: {len(candidate_ids)} зданий")
+        
+        if len(candidate_ids) == 0:
+            print(f"В BBox полигона нет зданий!")
+            return 0, 0
+        
+        print(f"Загрузка данных {len(candidate_ids)} кандидатов...")
+        
+        features_dict = {}
+        request = QgsFeatureRequest()
+        request.setFilterFids(list(candidate_ids))
+        request.setSubsetOfAttributes([population_field], population_layer.fields())
+        
+        for feature in population_layer.getFeatures(request):
+            features_dict[feature.id()] = feature
+        
+        print(f"   Загружено {len(features_dict)} объектов для обработки")
+        print(f"   Точная проверка пересечений...")
+        
+        inside_count = 0
+        partial_count = 0
+        processed = 0
+        
+        for fid in candidate_ids:
+            if fid not in features_dict:
+                continue
+                
+            feature = features_dict[fid]
+            building_geom = feature.geometry()
+            
+            if building_geom is None or building_geom.isEmpty():
+                continue
+            
+            if building_geom.intersects(polygon_geom_for_calculation):
+                pop_value = feature[population_field]
+                pop_num = 0
+                
+                if pop_value is not None and str(pop_value).strip() != '':
+                    try:
+                        pop_str = str(pop_value).replace(',', '.').strip()
+                        pop_num = float(pop_str) if pop_str else 0
+                    except (ValueError, TypeError):
+                        pop_num = 0
+                
+                if pop_num > 0:
+                    processed += 1
+                    
+                    if building_geom.within(polygon_geom_for_calculation):
+                        total_population += pop_num
+                        buildings_count += 1
+                        inside_count += 1
+                    else:
+                        intersection = building_geom.intersection(polygon_geom_for_calculation)
+                        if intersection and not intersection.isEmpty():
+                            building_area = building_geom.area()
+                            if building_area > 0:
+                                intersection_area = intersection.area()
+                                proportion = intersection_area / building_area
+                                
+                                if proportion > 0.05:
+                                    total_population += pop_num * proportion
+                                    buildings_count += proportion
+                                    partial_count += 1
+        
+        print(f"\nРЕЗУЛЬТАТЫ РАСЧЕТА:")
+        print(f"     Всего кандидатов: {len(candidate_ids)}")
+        print(f"     Обработано с населением: {processed}")
+        print(f"     Полностью внутри: {inside_count} зданий")
+        print(f"     Частично внутри: {partial_count} зданий")
+        print(f"     Общее население: {total_population:.0f} чел.")
+        print(f"     Учетных зданий: {buildings_count:.1f} ед.")
+        
+        return total_population, buildings_count
+    
+    except Exception as e:
+        print(f"Ошибка при расчете: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0, 0
+
+# ==================== ФУНКЦИЯ ОЧИСТКИ СЛОЕВ ====================
+def cleanup_previous_layers():
+    """Удаляет слои, созданные предыдущими запусками скрипта"""
+    print("=" * 60)
+    print("ОЧИСТКА ПРЕДЫДУЩИХ СЛОЕВ")
+    print("=" * 60)
+    
+    layers_to_remove = []
+    layer_names_to_remove = [
+        "Центры_всех_районов",
+        "Изохрона_район",
+        "Линии_район",
+        "Точка_старта_район",
+        "дороги_в_границах",
+        "merged_roads_temp",
+        "network_temp"
+    ]
+    
+    for layer in QgsProject.instance().mapLayers().values():
+        layer_name = layer.name()
+        
+        if any(name in layer_name for name in layer_names_to_remove):
+            layers_to_remove.append(layer.id())
+            print(f"  Удаление слоя: {layer_name}")
+    
+    for layer_id in layers_to_remove:
+        QgsProject.instance().removeMapLayer(layer_id)
+    
+    print(f"Удалено слоев: {len(layers_to_remove)}")
+    print("=" * 60)
+
+# ==================== ФУНКЦИИ ДЛЯ СОЗДАНИЯ ЦЕНТРОВ РАЙОНОВ ====================
+def find_layer(layer_names, geometry_type=None):
+    """Находит слой по имени"""
+    for layer_name in layer_names:
+        layers = QgsProject.instance().mapLayersByName(layer_name)
+        if layers:
+            layer = layers[0]
+            if isinstance(layer, QgsVectorLayer):
+                if geometry_type is None or layer.geometryType() == geometry_type:
+                    return layer
+    return None
+
+def get_district_centroids(district_layer):
+    """Получает центроиды для всех районов"""
+    centroids = {}
+    field_names = [field.name() for field in district_layer.fields()]
+
+    for feat in district_layer.getFeatures():
+        geom = feat.geometry()
+        if geom and not geom.isEmpty():
+            centroid = geom.centroid().asPoint()
+
+            if "NO" in field_names:
+                district_id = feat.attribute("NO")
+            elif "district_id" in field_names:
+                district_id = feat.attribute("district_id")
+            else:
+                district_id = feat.id()
+
+            district_name = f"Район_{district_id}"
+            area_km2 = geom.area() / 1e6
+            
+            centroids[district_id] = {
+                'centroid': centroid,
+                'name': district_name,
+                'area_km2': area_km2
+            }
+    return centroids
+
+def create_district_boundaries_layer(districts_main_layer):
+    """Создает слой границ районов"""
+    print("\n" + "=" * 60)
+    print("СОЗДАНИЕ ГРАНИЦ РАЙОНОВ")
+    print("=" * 60)
+
+    crs = districts_main_layer.crs()
+    boundaries_layer = QgsVectorLayer(f"Polygon?crs={crs.authid()}", "Границы_районов", "memory")
+    provider = boundaries_layer.dataProvider()
+
+    provider.addAttributes([
+        QgsField("district_id", QVariant.Int),
+        QgsField("district_name", QVariant.String),
+        QgsField("area_km2", QVariant.Double)
+    ])
+    boundaries_layer.updateFields()
+
+    features = []
+    field_names = [field.name() for field in districts_main_layer.fields()]
+
+    for feat in districts_main_layer.getFeatures():
+        geom = feat.geometry()
+        if geom and not geom.isEmpty():
+            if "NO" in field_names:
+                district_id = feat.attribute("NO")
+            elif "district_id" in field_names:
+                district_id = feat.attribute("district_id")
+            else:
+                district_id = feat.id()
+
+            district_name = f"Район_{district_id}"
+            area_km2 = geom.area() / 1e6
+
+            new_feat = QgsFeature()
+            new_feat.setGeometry(geom)
+            new_feat.setAttributes([
+                district_id,
+                district_name,
+                area_km2
+            ])
+            features.append(new_feat)
+
+    provider.addFeatures(features)
+    boundaries_layer.updateExtents()
+
+    symbol = QgsFillSymbol.createSimple({
+        'color': '255,255,255,0',  # прозрачный
+        'color_border': '128,128,128',  # серый
+        'width_border': '2.0',
+        'style': 'solid'
+    })
+    boundaries_layer.renderer().setSymbol(symbol)
+
+    # Подписи для районов
+    label_settings = QgsPalLayerSettings()
+    label_settings.fieldName = '"district_name"'
+    label_settings.isExpression = True
+
+    text_format = QgsTextFormat()
+    text_format.setSize(10)
+    text_format.setColor(QColor("black"))
+    text_format.setFont(QFont("Arial", 10, QFont.Bold))
+    text_format.buffer().setEnabled(True)
+    text_format.buffer().setColor(QColor("white"))
+    text_format.buffer().setSize(2)
+
+    label_settings.setFormat(text_format)
+    label_settings.enabled = True
+
+    layer_labeling = QgsVectorLayerSimpleLabeling(label_settings)
+    boundaries_layer.setLabeling(layer_labeling)
+    boundaries_layer.setLabelsEnabled(True)
+
+    QgsProject.instance().addMapLayer(boundaries_layer)
+
+    print(f"Создан слой границ для {boundaries_layer.featureCount()} районов")
+    print("=" * 60)
+
+    return boundaries_layer
+
+def create_all_district_centers(districts_main_layer):
+    """Создает слои центров И границ для ВСЕХ районов"""
+    print("\n" + "=" * 60)
+    print("СОЗДАНИЕ ЦЕНТРОВ И ГРАНИЦ ВСЕХ РАЙОНОВ")
+    print("=" * 60)
+
+    centroids = get_district_centroids(districts_main_layer)
+    if not centroids:
+        print("Не удалось получить центроиды районов")
+        return None, None, None
+
+    print(f"Найдено районов: {len(centroids)}")
+
+    # Слой границ
+    boundaries_layer = create_district_boundaries_layer(districts_main_layer)
+
+    # Слой центров
+    crs = districts_main_layer.crs()
+    centers_layer = QgsVectorLayer(f"Point?crs={crs.authid()}", "Центры_всех_районов", "memory")
+    provider = centers_layer.dataProvider()
+
+    provider.addAttributes([
+        QgsField("district_id", QVariant.Int),
+        QgsField("district_name", QVariant.String),
+        QgsField("area_km2", QVariant.Double),
+        QgsField("x_coord", QVariant.Double),
+        QgsField("y_coord", QVariant.Double)
+    ])
+    centers_layer.updateFields()
+
+    features = []
+    for district_id, district_data in centroids.items():
+        feat = QgsFeature()
+        feat.setGeometry(QgsGeometry.fromPointXY(district_data['centroid']))
+        feat.setAttributes([
+            district_id,
+            district_data['name'],
+            district_data['area_km2'],
+            district_data['centroid'].x(),
+            district_data['centroid'].y()
+        ])
+        features.append(feat)
+        print(f"  Добавлен район ID={district_id}, Название={district_data['name']}")
+
+    provider.addFeatures(features)
+    centers_layer.updateExtents()
+
+    symbol = QgsMarkerSymbol.createSimple({
+        'color': '255,0,0',
+        'size': '4',
+        'outline_color': '255,255,255',
+        'outline_width': '0.8'
+    })
+    centers_layer.renderer().setSymbol(symbol)
+
+    label_settings = QgsPalLayerSettings()
+    label_settings.fieldName = '"district_name"'
+    label_settings.isExpression = True
+
+    text_format = QgsTextFormat()
+    text_format.setSize(9)
+    text_format.setColor(QColor("red"))
+    text_format.setFont(QFont("Arial", 9, QFont.Bold))
+
+    label_settings.setFormat(text_format)
+    label_settings.enabled = True
+
+    layer_labeling = QgsVectorLayerSimpleLabeling(label_settings)
+    centers_layer.setLabeling(layer_labeling)
+    centers_layer.setLabelsEnabled(True)
+
+    QgsProject.instance().addMapLayer(centers_layer)
+
+    print(f"Созданы слои: центры ({len(centroids)} районов) и границы")
+    print("=" * 60)
+
+    return centers_layer, boundaries_layer, centroids
+
+def create_selected_district_centers_from_all(centroids, districts_main_layer):
+    """Выбирает района из всех созданных центров"""
+    print("\n" + "=" * 60)
+    print("ВЫБОР РАЙОНОВ ДЛЯ РАСЧЕТА")
+    print("=" * 60)
+    
+    selected_centroids = {}
+    for i, (district_id, district_data) in enumerate(list(centroids.items())[:SELECTED_DISTRICTS_COUNT]):
+        selected_centroids[district_id] = district_data
+        print(f"  Выбран для расчета район {i+1}: ID={district_id}, Название={district_data['name']}, Площадь={district_data['area_km2']:.2f} км²")
+    
+    print(f"Выбрано для расчета: {len(selected_centroids)} районов")
+    print("=" * 60)
+    
+    return selected_centroids
+
+# ==================== ФУНКЦИИ ДЛЯ ИЗОХРОН ====================
+def get_current_mode_settings():
+    """Возвращает настройки для автомобильного режима"""
+    return {
+        'time_intervals': CAR_TIME_INTERVALS,
+        'speed_kmh': CAR_SPEED_KMH,
+        'colors': CAR_COLORS,
+        'mode_name': 'автомобиль'
+    }
+
+def merge_road_layers():
+    """Объединяет слои дорог"""
+    road_layer_names = ["ispravlenny_uds", "Highway_OSM_Irkutsk"]
+    road_layers = []
+    
+    for layer_name in road_layer_names:
+        layer = find_layer([layer_name], QgsWkbTypes.LineGeometry)
+        if layer:
+            road_layers.append(layer)
+    
+    if not road_layers:
+        return None
+    
+    if len(road_layers) == 1:
+        return road_layers[0]
+    
+    merged_layer = QgsVectorLayer(
+        f"LineString?crs={road_layers[0].crs().authid()}",
+        "merged_roads_temp",
+        "memory"
+    )
+    
+    provider = merged_layer.dataProvider()
+    
+    for layer in road_layers:
+        features = []
+        for feature in layer.getFeatures():
+            new_feature = QgsFeature(feature)
+            features.append(new_feature)
+        
+        if features:
+            provider.addFeatures(features)
+    
+    merged_layer.updateExtents()
+    return merged_layer
+
+def clip_roads_with_boundary(roads_layer, boundary_layer):
+    """Обрезает дороги по границам районов"""
+    global CURRENT_MODE
+    
+    if CURRENT_MODE == 'car':
+        print(f"Для автомобильного режима обрезка дорог отключена")
+        return roads_layer
+    
+    if not boundary_layer:
+        return roads_layer
+    
+    try:
+        clip_params = {
+            'INPUT': roads_layer,
+            'OVERLAY': boundary_layer,
+            'OUTPUT': 'memory:'
+        }
+        
+        clipped = processing.run("native:clip", clip_params)['OUTPUT']
+        
+        if clipped.featureCount() > 0:
+            clipped_layer = QgsVectorLayer(
+                f"LineString?crs={clipped.crs().authid()}",
+                "дороги_в_границах",
+                "memory"
+            )
+            
+            provider = clipped_layer.dataProvider()
+            
+            for field in clipped.fields():
+                provider.addAttributes([field])
+            clipped_layer.updateFields()
+            
+            features = []
+            for feature in clipped.getFeatures():
+                new_feature = QgsFeature(clipped_layer.fields())
+                new_feature.setGeometry(feature.geometry())
+                
+                attributes = []
+                for i in range(clipped.fields().count()):
+                    attributes.append(feature.attribute(i))
+                new_feature.setAttributes(attributes)
+                
+                features.append(new_feature)
+            
+            provider.addFeatures(features)
+            clipped_layer.updateExtents()
+            
+            return clipped_layer
+        else:
+            return roads_layer
+            
+    except Exception as e:
+        return roads_layer
+
+def create_start_point_from_centroid(centroid_point, roads_crs, district_id, district_index):
+    """Создает точку старта из центроида"""
+    settings = get_current_mode_settings()
+    mode_name = settings['mode_name']
+    
+    point_layer = QgsVectorLayer(
+        f"Point?crs={roads_crs.authid()}",
+        f"Точка_старта_район{district_index+1}_{district_id}_{mode_name}",
+        "memory"
+    )
+    
+    feat = QgsFeature()
+    feat.setGeometry(QgsGeometry.fromPointXY(centroid_point))
+    point_layer.dataProvider().addFeatures([feat])
+    
+    if CURRENT_MODE == 'pedestrian':
+        color = '255,165,0'  # оранжевый для пешехода
+    else:
+        color = '0,100,200'  # синий для автомобиля
+    
+    symbol = QgsMarkerSymbol.createSimple({
+        'color': color,
+        'size': '6',
+        'outline_color': '255,255,255',
+        'outline_width': '1.5'
+    })
+    point_layer.renderer().setSymbol(symbol)
+    
+    return point_layer
+
+def calculate_distance_for_time(time_minutes):
+    """Рассчитывает расстояние для заданного времени"""
+    settings = get_current_mode_settings()
+    speed_ms = settings['speed_kmh'] * 1000 / 3600
+    distance_m = speed_ms * (time_minutes * 60)
+    print(f"    {time_minutes} мин * {settings['speed_kmh']} км/ч = {distance_m:.0f} м")
+    return distance_m
+
+def create_network_from_roads(roads_layer):
+    """Создает сеть из дорог для анализа"""
+    if not roads_layer or roads_layer.featureCount() == 0:
+        return None
+    
+    try:
+        network_layer = QgsVectorLayer(
+            f"LineString?crs={roads_layer.crs().authid()}",
+            "network_temp",
+            "memory"
+        )
+        
+        provider = network_layer.dataProvider()
+        
+        provider.addAttributes([
+            QgsField("id", QVariant.Int),
+            QgsField("cost", QVariant.Double),
+            QgsField("reverse_cost", QVariant.Double)
+        ])
+        network_layer.updateFields()
+        
+        features = []
+        for i, feature in enumerate(roads_layer.getFeatures()):
+            if feature.geometry():
+                new_feature = QgsFeature(network_layer.fields())
+                new_feature.setGeometry(feature.geometry())
+                
+                length = feature.geometry().length()
+                new_feature.setAttributes([i, length, length])
+                
+                features.append(new_feature)
+        
+        provider.addFeatures(features)
+        network_layer.updateExtents()
+        
+        return network_layer
+        
+    except Exception as e:
+        return None
+
+def calculate_isochrone_lines(start_point_layer, roads_layer, distance_m):
+    """Рассчитывает линии достижимости"""
+    try:
+        network_layer = create_network_from_roads(roads_layer)
+        if not network_layer:
+            print(f"   Не удалось создать сеть дорог для расстояния {distance_m:.0f} м")
+            return None
+        
+        # Разные алгоритмы в правильном порядке
+        algorithms = [
+            'native:serviceareafromlayer',  # Сначала новый алгоритм
+            'qgis:serviceareafromlayer',    # Потом старый
+        ]
+        
+        lines_result = None
+        
+        for algorithm in algorithms:
+            try:
+                print(f"    Используем алгоритм: {algorithm}")
+                
+                if algorithm == 'native:serviceareafromlayer':
+                    params = {
+                        'INPUT': network_layer,
+                        'STRATEGY': 0,
+                        'DIRECTION_FIELD': '',
+                        'VALUE_FORWARD': '',
+                        'VALUE_BACKWARD': '',
+                        'VALUE_BOTH': '',
+                        'DEFAULT_DIRECTION': 2,
+                        'SPEED_FIELD': '',
+                        'DEFAULT_SPEED': 1,
+                        'TOLERANCE': 0,
+                        'START_POINTS': start_point_layer,
+                        'TRAVEL_COST': distance_m,
+                        'OUTPUT_LINES': 'memory:',
+                        'OUTPUT': 'memory:'
+                    }
+                else:  # qgis:serviceareafromlayer
+                    params = {
+                        'INPUT': network_layer,
+                        'START_POINTS': start_point_layer,
+                        'STRATEGY': 0,
+                        'TRAVEL_COST': distance_m,
+                        'DIRECTION': 2,
+                        'OUTPUT_LINES': 'memory:',
+                        'OUTPUT': 'memory:'
+                    }
+                
+                result = processing.run(algorithm, params)
+                
+                if 'OUTPUT_LINES' in result and result['OUTPUT_LINES']:
+                    lines = result['OUTPUT_LINES']
+                    if lines.featureCount() > 0:
+                        lines_result = lines
+                        print(f"    Алгоритм {algorithm}: найдено {lines.featureCount()} сегментов линий")
+                        
+                        # Проверяем, что линии имеют разную длину
+                        lengths = []
+                        for feature in lines.getFeatures():
+                            if feature.geometry():
+                                lengths.append(feature.geometry().length())
+                        
+                        if lengths:
+                            avg_length = sum(lengths) / len(lengths)
+                            max_length = max(lengths)
+                            print(f"    Статистика длин: средняя={avg_length:.0f} м, максимальная={max_length:.0f} м")
+                        
+                        break
+                        
+            except Exception as e:
+                print(f"    Ошибка в алгоритме {algorithm}: {e}")
+                continue
+        
+        if not lines_result:
+            print(f"   Не удалось создать линии для расстояния {distance_m:.0f} м")
+            return None
+        
+        total_length = 0
+        for feature in lines_result.getFeatures():
+            if feature.geometry():
+                total_length += feature.geometry().length()
+        
+        print(f"    Длина всех линий: {total_length:.0f} м, заданное расстояние: {distance_m:.0f} м")
+        
+        return lines_result
+        
+    except Exception as e:
+        print(f"Ошибка при расчете линий: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def extract_end_points(lines_layer):
+    """Извлекает конечные точки из линий"""
+    end_points = []
+    
+    for feature in lines_layer.getFeatures():
+        geom = feature.geometry()
+        
+        if geom and not geom.isEmpty():
+            if geom.isMultipart():
+                multi_line = geom.asMultiPolyline()
+                for line in multi_line:
+                    if len(line) >= 2:
+                        end_points.append(line[-1])
+            else:
+                line_pts = geom.asPolyline()
+                if len(line_pts) >= 2:
+                    end_points.append(line_pts[-1])
+    
+    return end_points
+
+def create_polygon_from_points(points, name, color, border_color, mode, roads_crs, population_layer, population_field):
+    """Создает ЕДИНЫЙ полигон из списка КРАЙНИХ точек с населением"""
+    
+    if len(points) < 3:
+        print(f"Недостаточно КРАЙНИХ точек для полигона {name} ({len(points)} точек)")
+        return None
+    
+    print(f"\nСоздание полигона {name} из {len(points)} крайних точек...")
+    
+    name_parts = name.split('_')
+    time_min = None
+    
+    for part in name_parts:
+        if 'мин' in part:
+            time_str = ''.join(filter(str.isdigit, part))
+            if time_str:
+                time_min = int(time_str)
+                break
+    
+    if time_min is None:
+        if len(name_parts) >= 4:
+            time_part = name_parts[3]
+            time_str = ''.join(filter(str.isdigit, time_part))
+            if time_str:
+                time_min = int(time_str)
+    
+    if time_min is None:
+        print(f"ВНИМАНИЕ: Не удалось извлечь время из названия: {name}")
+        time_min = 0
+    
+    print(f"   Извлеченное время: {time_min} мин")
+    
+    temp_layer = QgsVectorLayer(f"Point?crs={roads_crs.authid()}", f"temp_{name}", "memory")
+    provider = temp_layer.dataProvider()
+    
+    features = []
+    for point in points:
+        feat = QgsFeature()
+        feat.setGeometry(QgsGeometry.fromPointXY(point))
+        features.append(feat)
+    
+    provider.addFeatures(features)
+    temp_layer.updateExtents()
+    
+    print(f"   Создание выпуклой оболочки...")
+    
+    try:
+        dissolve_params = {
+            'INPUT': temp_layer,
+            'FIELD': [],
+            'OUTPUT': 'memory:'
+        }
+        dissolved = processing.run("native:dissolve", dissolve_params)['OUTPUT']
+        
+        convex_params = {'INPUT': dissolved, 'OUTPUT': 'memory:'}
+        convex_layer = processing.run("native:convexhull", convex_params)['OUTPUT']
+        
+        if convex_layer.featureCount() == 0:
+            print(f"Не удалось создать выпуклой оболочки для {name}")
+            return None
+        
+    except Exception as e:
+        print(f"Ошибка при создании выпуклой оболочки: {e}")
+        return None
+    
+    convex_features = list(convex_layer.getFeatures())
+    polygon_geom = convex_features[0].geometry()
+    
+    print(f"   Расчет населения...")
+    total_population, buildings_count = calculate_population_in_polygon(
+        polygon_geom, 
+        roads_crs,
+        population_layer,
+        population_field
+    )
+    
+    polygon_layer = QgsVectorLayer(f"Polygon?crs={roads_crs.authid()}", name, "memory")
+    polygon_provider = polygon_layer.dataProvider()
+    
+    polygon_provider.addAttributes([
+        QgsField("id", QVariant.Int),
+        QgsField("name", QVariant.String),
+        QgsField("time_min", QVariant.Int),
+        QgsField("mode", QVariant.String),
+        QgsField("points_count", QVariant.Int),
+        QgsField("area_m2", QVariant.Double),
+        QgsField("buildings_count", QVariant.Double),
+        QgsField("population", QVariant.Double),
+        QgsField("density_ha", QVariant.Double)
+    ])
+    polygon_layer.updateFields()
+    
+    # Рассчитываем площадь
+    area_calc = QgsDistanceArea()
+    area_calc.setSourceCrs(roads_crs, QgsProject.instance().transformContext())
+    area_calc.setEllipsoid(roads_crs.ellipsoidAcronym())
+    area_m2 = area_calc.measureArea(polygon_geom)
+    
+    # Рассчитываем плотность
+    area_ha = area_m2 / 10000
+    density_ha = total_population / area_ha if area_ha > 0 else 0
+    
+    # Используем извлеченное время
+    time_min_value = time_min
+    
+    feat = QgsFeature()
+    feat.setGeometry(polygon_geom)
+    feat.setAttributes([
+        1,
+        name,
+        time_min_value, 
+        mode,
+        len(points),
+        area_m2,
+        buildings_count,
+        total_population,
+        density_ha
+    ])
+    polygon_provider.addFeatures([feat])
+    
+    polygon_layer.updateExtents()
+    
+    symbol = QgsFillSymbol.createSimple({
+        'color': color,
+        'color_border': border_color,
+        'width_border': '1.5',
+        'style': 'solid'
+    })
+    polygon_layer.renderer().setSymbol(symbol)
+    
+    label_settings = QgsPalLayerSettings()
+    if population_layer and population_field:
+        label_settings.fieldName = '''
+            concat(
+                "name",
+                '\n',
+                "time_min", ' мин',
+                '\n',
+                round("population"), ' чел.',
+                '\n',
+                round("density_ha", 1), ' чел/га'
+            )
+        '''
+    else:
+        label_settings.fieldName = '''
+            concat(
+                "name",
+                '\n',
+                "time_min", ' мин',
+                '\n',
+                round("area_m2" / 10000, 2), ' га'
+            )
+        '''
+    label_settings.isExpression = True
+    
+    text_format = QgsTextFormat()
+    text_format.setSize(9)
+    text_format.setColor(QColor("white"))
+    text_format.setFont(QFont("Arial", 9, QFont.Bold))
+    text_format.buffer().setEnabled(True)
+    text_format.buffer().setColor(QColor("black"))
+    text_format.buffer().setSize(2)
+    
+    label_settings.setFormat(text_format)
+    label_settings.enabled = True
+    
+    layer_labeling = QgsVectorLayerSimpleLabeling(label_settings)
+    polygon_layer.setLabeling(layer_labeling)
+    polygon_layer.setLabelsEnabled(True)
+    
+    print(f"Полигон {name} создан:")
+    print(f"Время: {time_min_value} мин")
+    print(f"Площадь: {area_m2:.0f} м² ({area_ha:.2f} га)")
+    if population_layer and population_field:
+        print(f"Здания: {buildings_count:.1f} шт.")
+        print(f"Население: {total_population:.0f} чел.")
+        print(f"Плотность: {density_ha:.1f} чел/га")
+    
+    return polygon_layer
+
+def run_isochrone_for_selected_district(district_id, centroid_point, roads_layer, boundary_layer, district_name, district_index):
+    """Запускает расчет изохрон для одного района"""
+    settings = get_current_mode_settings()
+    mode_name = settings['mode_name']
+    
+    print(f"\nРАЙОН {district_index+1}: {district_name} (ID: {district_id}) - РЕЖИМ: {mode_name.upper()}")
+    print("-" * 60)
+    
+    # Для автомобилей используем ispravlenny_uds, для пешеходов - Highway_OSM_Irkutsk
+    if CURRENT_MODE == 'car':
+        road_layer_name = "ispravlenny_uds"
+    else:
+        road_layer_name = "Highway_OSM_Irkutsk"
+    
+    roads_layer = find_layer([road_layer_name], QgsWkbTypes.LineGeometry)
+    
+    if not roads_layer:
+        print(f"Слой дорог '{road_layer_name}' не найден")
+        return []
+    
+    print(f"Используется слой дорог: {roads_layer.name()}")
+    
+    clipped_roads = clip_roads_with_boundary(roads_layer, boundary_layer)
+    roads_crs = clipped_roads.crs()
+    
+    print(f"Анализ дорожной сети:")
+    print(f"Количество дорог: {clipped_roads.featureCount()}")
+    
+    total_road_length = 0
+    for feature in clipped_roads.getFeatures():
+        if feature.geometry():
+            total_road_length += feature.geometry().length()
+    
+    print(f"Общая длина дорог: {total_road_length:.0f} м ({total_road_length/1000:.1f} км)")
+    
+    start_point_layer = create_start_point_from_centroid(centroid_point, roads_crs, district_id, district_index)
+    QgsProject.instance().addMapLayer(start_point_layer)
+
+    isochrone_layers = []
+    all_end_points = {}
+
+    for i, time_min in enumerate(settings['time_intervals']):
+        print(f"  Временной интервал: {time_min} минут")
+
+        distance_m = calculate_distance_for_time(time_min)
+        
+        # Рассчитываем линии
+        lines_layer = calculate_isochrone_lines(start_point_layer, clipped_roads, distance_m)
+        
+        if not lines_layer or lines_layer.featureCount() == 0:
+            print(f"Основной метод не сработал, пробуем альтернативный...")
+            lines_layer = calculate_isochrone_lines_alternative(start_point_layer, clipped_roads, distance_m)
+
+        if lines_layer and lines_layer.featureCount() > 0:
+            lines_layer.setName(f"Линии_район{district_index+1}_{district_id}_{time_min}мин_{mode_name}")
+
+            line_color = settings['colors'][i][1]
+            line_symbol = QgsLineSymbol.createSimple({
+                'color': line_color,
+                'width': '0.6',
+                'style': 'solid'
+            })
+            lines_layer.renderer().setSymbol(line_symbol)
+
+            QgsProject.instance().addMapLayer(lines_layer)
+
+            end_points = extract_end_points(lines_layer)
+            all_end_points[time_min] = end_points
+            
+            # Проверяем уникальность точек
+            unique_points = list(set([(p.x(), p.y()) for p in end_points]))
+            print(f"Созданы линии: {lines_layer.featureCount()} сегментов, {len(end_points)} точек, {len(unique_points)} уникальных")
+        else:
+            print(f"Не удалось создать линии для {time_min} мин")
+            all_end_points[time_min] = []
+
+    for i, time_min in enumerate(settings['time_intervals']):
+        points = all_end_points.get(time_min, [])
+
+        if len(points) >= 3:
+            polygon_name = f"Изохрона_район{district_index+1}_{district_id}_{time_min}мин_{mode_name}"
+
+            polygon_layer = create_polygon_from_points(
+                points,
+                polygon_name,
+                settings['colors'][i][0],
+                settings['colors'][i][1],
+                CURRENT_MODE,
+                roads_crs,
+                POPULATION_LAYER,
+                POPULATION_FIELD
+            )
+
+            if polygon_layer:
+                QgsProject.instance().addMapLayer(polygon_layer)
+                isochrone_layers.append(polygon_layer)
+                print(f"Создана изохрона: {polygon_name}")
+        else:
+            print(f"Недостаточно точек для изохроны {time_min} мин: {len(points)} точек")
+    
+    print(f"Создано изохрон для района: {len(isochrone_layers)}")
+    
+    return isochrone_layers
+
+# ==================== ФУНКЦИИ РАСЧЕТА ИЗОХРОН ====================
+def run_car_isochrones_for_selected_districts(selected_centroids, roads_layer, districts_main_layer):
+    """Запускает расчет автомобильных изохрон для выбранных районов"""
+    print("\n" + "=" * 60)
+    print("РЕЖИМ: АВТОМОБИЛЬ")
+    print("=" * 60)
+
+    global CURRENT_MODE
+    CURRENT_MODE = 'car'
+
+    car_layers = []
+
+    for i, (district_id, district_data) in enumerate(selected_centroids.items()):
+        isochrone_layers = run_isochrone_for_selected_district(
+            district_id,
+            district_data['centroid'],
+            roads_layer,
+            districts_main_layer,
+            district_data['name'],
+            i
+        )
+
+        car_layers.extend(isochrone_layers)
+
+    print(f"Автомобильные изохроны созданы: {len(car_layers)} слоев")
+    return car_layers
+
+# ==================== ФУНКЦИЯ РАСЧЕТА ДОСТУПНОСТИ ====================
+def calculate_district_accessibility(selected_centroids, all_isochrone_layers):
+    """Рассчитывает автомобильную доступность районов по формуле (только для районов с изохронами)"""
+    print("\n" + "=" * 80)
+    print("РАСЧЕТ ВЗВЕШЕННОЙ ДОСТУПНОСТИ РАЙОНОВ ПО ФОРМУЛЕ")
+    print("=" * 80)
+
+    accessibility_data = {}
+
+    # Определяем, для каких районов есть изохроны
+    districts_with_isochrones = set()
+    for layer in all_isochrone_layers:
+        if layer.name().startswith("Изохрона_район") and ("автомобиль" in layer.name() or "_авто" in layer.name()):
+            name_parts = layer.name().split('_')
+            for part in name_parts:
+                if part.isdigit():
+                    try:
+                        district_id = int(part)
+                        districts_with_isochrones.add(district_id)
+                        break
+                    except ValueError:
+                        continue
+
+    print(f"Найдены изохроны для районов: {sorted(districts_with_isochrones)}")
+
+    # Рассчитываем доступность только для районов с изохронами
+    for district_id in districts_with_isochrones:
+        if district_id in selected_centroids:
+            district_data = selected_centroids[district_id]
+            district_layers = [layer for layer in all_isochrone_layers
+                              if layer.name().startswith(f"Изохрона_район")
+                              and str(district_id) in layer.name()
+                              and ("автомобиль" in layer.name() or "_авто" in layer.name())]
+
+            if district_layers:
+                # Рассчитываем TA по формуле
+                TA = calculate_weighted_accessibility(district_layers)
+            else:
+                TA = 0
+
+            accessibility_data[district_id] = {
+                'name': district_data['name'],
+                'TA': TA,
+                'area_km2': district_data.get('area_km2', 0)
+            }
+
+            print(f"Район {district_id} ({district_data['name']}): TA = {TA:.2f} мин")
+            print("-" * 40)
+        else:
+            print(f"Район {district_id}: найден в изохронах, но отсутствует в selected_centroids")
+
+    return accessibility_data
+
+
+def calculate_weighted_accessibility(isochrone_layers_for_district):
+    """Рассчитывает взвешенную доступность по формуле"""
+    
+    print("\n" + "="*60)
+    print("РАСЧЕТ ВЗВЕШЕННОЙ ДОСТУПНОСТИ")
+    print("="*60)
+    
+    isochrone_data = []
+    
+    for layer in isochrone_layers_for_district:
+        features = list(layer.getFeatures())
+        if features:
+            feature = features[0]
+            
+            time_min = feature['time_min']
+            population = feature['population']
+            
+            print(f"  Изохрона: {layer.name()}")
+            print(f"    Время: {time_min} мин")
+            print(f"    Население: {population:.0f} чел.")
+            
+            isochrone_data.append({
+                'time': float(time_min),
+                'population': float(population),
+                'layer': layer
+            })
+    
+    isochrone_data.sort(key=lambda x: x['time'])
+    
+    print(f"\nВсего изохрон: {len(isochrone_data)}")
+    print("Сортировка по времени:")
+    for data in isochrone_data:
+        print(f"  {data['time']} мин: {data['population']:.0f} чел.")
+    
+    if len(isochrone_data) < 2:
+        print("ОШИБКА: Нужно минимум 2 изохроны для расчета")
+        return 0
+    
+    print("\nРАСЧЕТ ПО ФОРМУЛЕ:")
+    print("TA = Σ(ti * Gi) / Σ(Gi)")
+    print("где:")
+    print("  ti - время изохроны")
+    print("  Gi - население в интервале между изохронами")
+    
+    weighted_sum = 0.0
+    total_generation = 0.0
+    
+    for i, data in enumerate(isochrone_data):
+        ti = data['time']
+        
+        if i == 0:
+            Gi = data['population']
+            print(f"\n  Интервал 1: 0-{ti} мин")
+            print(f"    t1 = {ti} мин")
+            print(f"    G1 = население(0-{ti}мин) = {Gi:.0f} чел.")
+        else:
+            prev_population = isochrone_data[i-1]['population']
+            prev_time = isochrone_data[i-1]['time']
+            Gi = data['population'] - prev_population
+            
+            print(f"\n  Интервал {i+1}: {prev_time}-{ti} мин")
+            print(f"    t{i+1} = {ti} мин")
+            print(f"    G{i+1} = население({prev_time}-{ti}мин) = {data['population']:.0f} - {prev_population:.0f} = {Gi:.0f} чел.")
+        
+        weighted_sum += ti * Gi
+        total_generation += Gi
+        print(f"    ti * Gi = {ti} * {Gi:.0f} = {ti * Gi:.0f}")
+    
+    print(f"\nИтоги:")
+    print(f"  Σ(ti * Gi) = {weighted_sum:.0f}")
+    print(f"  Σ(Gi) = {total_generation:.0f}")
+    
+    if total_generation > 0:
+        TA = weighted_sum / total_generation
+        print(f"  TA = {weighted_sum:.0f} / {total_generation:.0f} = {TA:.2f} мин")
+    else:
+        TA = 0
+        print("ОШИБКА: сумма генерации = 0")
+    
+    return TA
+
+def update_district_boundaries_with_accessibility(accessibility_data):
+    """Обновляет слой границ районов с показателями доступности"""
+
+    print("\n" + "=" * 60)
+    print("ОБНОВЛЕНИЕ СЛОЯ ГРАНИЦ РАЙОНОВ")
+    print("=" * 60)
+
+    # Находим слой границ районов
+    boundaries_layer = None
+    for layer in QgsProject.instance().mapLayers().values():
+        if layer.name() == "Границы_районов":
+            boundaries_layer = layer
+            break
+
+    if not boundaries_layer:
+        print("Слой 'Границы_районов' не найден!")
+        return None
+
+    print(f"Найден слой границ: {boundaries_layer.name()}")
+
+    provider = boundaries_layer.dataProvider()
+    fields = boundaries_layer.fields()
+
+    if 'TA_авто' not in [field.name() for field in fields]:
+        provider.addAttributes([QgsField("TA_авто", QVariant.Double)])
+        boundaries_layer.updateFields()
+        print("Добавлено поле 'TA_авто'")
+
+    if 'TA_катег' not in [field.name() for field in fields]:
+        provider.addAttributes([QgsField("TA_катег", QVariant.String)])
+        boundaries_layer.updateFields()
+        print("Добавлено поле 'TA_катег'")
+
+    field_idx_ta = boundaries_layer.fields().indexOf('TA_авто')
+    field_idx_cat = boundaries_layer.fields().indexOf('TA_катег')
+
+    features = []
+    for feature in boundaries_layer.getFeatures():
+        district_id = feature['district_id']
+
+        if district_id in accessibility_data:
+            TA = accessibility_data[district_id]['TA']
+
+            if TA <= 6:
+                category = "Очень высокая"
+            elif TA <= 10:
+                category = "Высокая"
+            elif TA <= 15:
+                category = "Средняя"
+            else:
+                category = "Низкая"
+
+            feature.setAttribute(field_idx_ta, round(TA, 2))
+            feature.setAttribute(field_idx_cat, category)
+            features.append(feature)
+
+            print(f"  Район {district_id}: TA = {TA:.2f} мин, Категория: {category}")
+        else:
+            feature.setAttribute(field_idx_ta, 0.0)
+            feature.setAttribute(field_idx_cat, "Нет данных")
+            features.append(feature)
+
+    if features:
+        updates = {}
+        for feature in features:
+            updates[feature.id()] = {
+                field_idx_ta: feature['TA_авто'],
+                field_idx_cat: feature['TA_катег']
+            }
+
+        provider.changeAttributeValues(updates)
+
+    update_boundary_labels(boundaries_layer)
+
+    print(f"Обновлено {len(features)} районов")
+    return boundaries_layer
+
+def update_boundary_labels(boundaries_layer):
+    """Обновляет подписи для слоя границ районов"""
+    
+    print("\nОбновление подписей...")
+    
+    label_settings = QgsPalLayerSettings()
+    label_settings.fieldName = '''
+        concat(
+            "district_name",
+            '\n',
+            'TA: ', 
+            CASE 
+                WHEN "TA_авто" IS NOT NULL THEN round("TA_авто", 1)
+                ELSE 'нет данных'
+            END,
+            ' мин (', "TA_катег", ')'
+        )
+    '''
+    label_settings.isExpression = True
+    
+    text_format = QgsTextFormat()
+    text_format.setSize(10)
+    text_format.setColor(QColor("black"))
+    text_format.setFont(QFont("Arial", 10, QFont.Bold))
+    text_format.buffer().setEnabled(True)
+    text_format.buffer().setColor(QColor("white"))
+    text_format.buffer().setSize(2)
+    
+    label_settings.setFormat(text_format)
+    label_settings.enabled = True
+    # label_settings.placement = QgsPalLayerSettings.OverPoint
+    
+    layer_labeling = QgsVectorLayerSimpleLabeling(label_settings)
+    boundaries_layer.setLabeling(layer_labeling)
+    boundaries_layer.setLabelsEnabled(True)
+    
+    print("Подписи обновлены")
+
+def calculate_single_mode_accessibility(district_id, time_areas, time_population, mode):
+    """Рассчитывает доступность для автомобильного режима"""
+    visits_generation = []
+
+    # Используем только автомобильные временные интервалы
+    time_intervals = CAR_TIME_INTERVALS
+    
+    # Рассчитываем G1 для первого интервала
+    if time_intervals[0] in time_areas and time_intervals[0] in time_population:
+        population = time_population[time_intervals[0]]
+        normalized_population = population / 1000
+        if normalized_population > 0:
+            G1 = time_areas[time_intervals[0]] * normalized_population
+            visits_generation.append((time_intervals[0], G1))
+            print(f"  Район {district_id} ({mode}): G(0-{time_intervals[0]}) = {G1:.2f} (население: {population:.0f})")
+    
+    # Рассчитываем для остальных интервалов
+    prev_time = time_intervals[0]
+    for time_min in time_intervals[1:]:
+        if prev_time in time_areas and time_min in time_areas and time_min in time_population:
+            area_diff = time_areas[time_min] - time_areas[prev_time]
+            if area_diff > 0:
+                population = time_population[time_min]
+                normalized_population = population / 1000
+                if normalized_population > 0:
+                    Gi = area_diff * normalized_population
+                    visits_generation.append((time_min, Gi))
+                    print(f"  Район {district_id} ({mode}): G({prev_time}-{time_min}) = {Gi:.2f} (население: {population:.0f})")
+            prev_time = time_min
+    
+    if visits_generation:
+        weighted_sum = sum(ti * Gi for ti, Gi in visits_generation)
+        total_generation = sum(Gi for _, Gi in visits_generation)
+        
+        if total_generation > 0:
+            accessibility = weighted_sum / total_generation
+        else:
+            accessibility = 0
+    else:
+        accessibility = 0
+    
+    return accessibility
+
+# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
+def run_isochrone_for_three_districts():
+    """Основная функция расчета автомобильных изохрон для 3 районов"""
+    print("=" * 80)
+    print("РАСЧЕТ АВТОМОБИЛЬНЫХ ИЗОХРОН И ДОСТУПНОСТИ РАЙОНОВ")
+    print("=" * 80)
+
+    global CURRENT_MODE, POPULATION_LAYER, POPULATION_FIELD
+
+    cleanup_previous_layers()
+
+    print("\nЗАГРУЗКА ИСХОДНЫХ ДАННЫХ")
+    print("=" * 60)
+
+    districts_main_layer = find_layer(["Укрупненные_mainzone"], QgsWkbTypes.PolygonGeometry)
+    roads_layer = find_layer(["ispravlenny_uds"], QgsWkbTypes.LineGeometry)
+
+    if not districts_main_layer or districts_main_layer.featureCount() == 0:
+        print("Слой районов 'Укрупненные_mainzone' не найден или пуст")
+        return
+
+    if not roads_layer:
+        print("Слой дорог 'ispravlenny_uds' не найден")
+        return
+
+    print("✓ Слой районов: найден")
+    print("✓ Слой автомобильных дорог: найден")
+
+    print("\nПОИСК СЛОЯ С НАСЕЛЕНИЕМ")
+    print("=" * 60)
+
+    POPULATION_LAYER, POPULATION_FIELD = find_population_layer()
+
+    if not POPULATION_LAYER or not POPULATION_FIELD:
+        print("ВНИМАНИЕ: Слой с населением не найден или не определено поле!")
+        print("   Доступность будет рассчитана только на основе площади.")
+        print("   Для точного расчета убедитесь, что слой 'Здания_насел_attract' загружен.")
+    else:
+        print(f"Слой населения: {POPULATION_LAYER.name()}")
+        print(f"Поле населения: '{POPULATION_FIELD}'")
+
+    all_centers_layer, boundaries_layer, all_centroids = create_all_district_centers(districts_main_layer)
+
+    if not all_centers_layer or not boundaries_layer or not all_centroids:
+        print("Не удалось создать центры и границы всех районов")
+        return
+
+    selected_centroids = create_selected_district_centers_from_all(all_centroids, districts_main_layer)
+
+    if not selected_centroids:
+        print("Не удалось выбрать районы для расчета")
+        return
+
+    print("\n" + "=" * 80)
+    print("РАСЧЕТ АВТОМОБИЛЬНЫХ ИЗОХРОН ДЛЯ ВЫБРАННЫХ РАЙОНОВ")
+    print("=" * 80)
+
+    car_layers = run_car_isochrones_for_selected_districts(
+        selected_centroids, roads_layer, districts_main_layer
+    )
+
+    accessibility_data = calculate_district_accessibility(selected_centroids, car_layers)
+    updated_boundaries = update_district_boundaries_with_accessibility(accessibility_data)
+    
+    print("\n" + "=" * 80)
+    print("ИТОГОВАЯ СТАТИСТИКА")
+    print("=" * 80)
+    
+    print(f"\nОбработано районов: {len(selected_centroids)}")
+    print(f"Создано автомобильных изохрон: {len(car_layers)}")
+    
+    print("\nДОСТУПНОСТЬ РАЙОНОВ (ВЗВЕШЕННАЯ ПО ФОРМУЛЕ):")
+    print("-" * 80)
+    print(f"{'Район ID':<12} {'Название':<20} {'TA (мин)':<12} {'Категория':<15}")
+    print("-" * 80)
+
+    for district_id, data in accessibility_data.items():
+        TA = data['TA']
+        
+        if TA <= 6:
+            category = "Очень высокая"
+        elif TA <= 10:
+            category = "Высокая"
+        elif TA <= 15:
+            category = "Средняя"
+        else:
+            category = "Низкая"
+
+        print(f"{district_id:<12} {data['name']:<20} {TA:<12.2f} {category:<15}")
+
+    print("-" * 80)
+
+    avg_TA = sum(data['TA'] for data in accessibility_data.values()) / len(accessibility_data)
+    print(f"\nСредняя доступность по всем районам: {avg_TA:.2f} мин")
+    
+    try:
+        from qgis.utils import iface
+        if iface:
+            iface.mapCanvas().refresh()
+            print("\nКарта обновлена")
+    except:
+        print("\nОбновление карты недоступно (запуск вне интерфейса QGIS)")
+    
+    print("\n" + "=" * 80)
+    print("РАСЧЕТ ЗАВЕРШЕН")
+    print("=" * 80)
+    
+    return car_layers, accessibility_data, updated_boundaries
+
+# ==================== ЗАПУСК РАСЧЕТА ====================
+run_isochrone_for_three_districts()
